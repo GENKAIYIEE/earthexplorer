@@ -1,10 +1,10 @@
 import { Suspense, useRef, useEffect } from "react";
-import useHandTracking from "./hooks/useHandTracking";
-import GlobeScene from "./components/GlobeScene";
+import useAntiGravityTracking from "./hooks/useAntiGravityTracking";
+import AntiGravityScene from "./components/AntiGravityScene";
 import "./index.css";
 
 // ════════════════════════════════════════════════════════════════
-//  PERFORMANCE-OPTIMIZED APP
+//  ANTI-GRAVITY EXPLORER
 //
 //  ⚡ PERF: This component only re-renders when hudGesture changes
 //  (~4 fps from the HUD throttle). The 3D scene and hand tracking
@@ -15,10 +15,10 @@ import "./index.css";
 const LANDMARK_INDICES = [4, 8, 12, 16, 20];
 
 const GESTURE_DISPLAY = {
-  PINCH_ZOOM: { icon: "🤏", label: "ZOOM ↕", color: "#22d3ee" },
-  INDEX_MOVE: { icon: "☝️", label: "MOVE", color: "#a855f7" },
-  OPEN_PALM: { icon: "🖐️", label: "AUTO-ROTATE", color: "#34d399" },
-  FIST: { icon: "✊", label: "STOPPED", color: "#f87171" },
+  PINCH: { icon: "🤏", label: "LEVITATE ↕", color: "#22d3ee" },
+  INDEX_MOVE: { icon: "☝️", label: "PULL", color: "#a855f7" },
+  OPEN_PALM: { icon: "🖐️", label: "FLOAT", color: "#34d399" },
+  FIST: { icon: "✊", label: "FREEZE", color: "#f87171" },
   IDLE: { icon: "👁", label: "TRACKING", color: "#94a3b8" },
   NONE: { icon: "🖐️", label: "SHOW HAND", color: "#64748b" },
 };
@@ -176,7 +176,7 @@ export default function App() {
     hudTracking,
     webcamRef,
     error,
-  } = useHandTracking();
+  } = useAntiGravityTracking();
 
   const config = GESTURE_DISPLAY[hudGesture] || GESTURE_DISPLAY.NONE;
 
@@ -186,9 +186,9 @@ export default function App() {
       {/* Layer 1: Webcam (own rAF loop) */}
       <FullscreenWebcam webcamRef={webcamRef} />
 
-      {/* Layer 2: 3D Globe (reads trackingDataRef in useFrame) */}
+      {/* Layer 2: 3D Anti-Gravity Scene (reads trackingDataRef in useFrame) */}
       <Suspense fallback={null}>
-        <GlobeScene trackingDataRef={trackingDataRef} />
+        <AntiGravityScene trackingDataRef={trackingDataRef} />
       </Suspense>
 
       {/* Layer 3: Hand dots (own rAF loop, direct DOM mutation) */}
@@ -236,17 +236,17 @@ export default function App() {
           padding: 16, color: "#e2e8f0", fontSize: 12, lineHeight: 1.7,
         }}>
           <div style={{ color: "#fff", fontWeight: "bold", fontSize: 11, letterSpacing: "0.1em", marginBottom: 8 }}>
-            CONTROLS
+            ANTI-GRAVITY CONTROLS
           </div>
-          <div>🤏 <b style={{ color: "#22d3ee" }}>Pinch</b> + move up/down → Zoom</div>
-          <div>☝️ <b style={{ color: "#a855f7" }}>Point index</b> → Rotate globe</div>
-          <div>🖐️ <b style={{ color: "#34d399" }}>Open palm</b> → Auto-rotate</div>
-          <div>✊ <b style={{ color: "#f87171" }}>Fist</b> → Stop all motion</div>
+          <div>🤏 <b style={{ color: "#22d3ee" }}>Pinch</b> + move up/down → Levitate</div>
+          <div>☝️ <b style={{ color: "#a855f7" }}>Point index</b> → Pull objects</div>
+          <div>🖐️ <b style={{ color: "#34d399" }}>Open palm</b> → Float / Suspend</div>
+          <div>✊ <b style={{ color: "#f87171" }}>Fist</b> → Freeze all</div>
         </div>
 
         {/* Bottom-left: Watermark */}
         <div style={{ position: "absolute", bottom: 16, left: 16, color: "rgba(255,255,255,0.4)", fontSize: 14, fontWeight: "bold" }}>
-          CESIUM ion
+          ANTI-GRAVITY
         </div>
       </div>
 
