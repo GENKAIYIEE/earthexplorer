@@ -1,186 +1,231 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 
-// ── Constants ───────────────────────────────────────────
-const PINCH_MIN = 0.03;
-const PINCH_MAX = 0.25;
-const ZOOM_MIN = 0.5;
-const ZOOM_MAX = 2.0;
-const LERP_FACTOR = 0.1;
-const ROTATION_SENSITIVITY = 4.0;
-const DRAG_THRESHOLD = 0.005;
-const PINCH_ENGAGE_THRESHOLD = 0.08;
+// ════════════════════════════════════════════════════════════════
+//  PERFORMANCE-OPTIMIZED HAND TRACKING HOOK
+//
+//  Key optimizations (marked with "⚡ PERF"):
+//    1. Shared ref object instead of useState for high-frequency data
+//    2. Frame-skipping: process every 2nd video frame
+//    3. Zero heap allocations in the hot detection loop
+//    4. HUD-only useState throttled to ~4 fps (250ms)
+//    5. Pre-allocated reusable objects (no object spread)
+// ════════════════════════════════════════════════════════════════
 
-// MediaPipe WASM version – pin to avoid CDN cache issues
+// ── MediaPipe landmark indices ──────────────────────────
+// Wrist=0, Thumb TIP=4, Index TIP=8, Middle TIP=12, Ring TIP=16, Pinky TIP=20
+// Thumb IP=3, Index PIP=6, Middle PIP=10, Ring PIP=14, Pinky PIP=18
+
+// ── Thresholds ──────────────────────────────────────────
+const PINCH_THRESHOLD = 0.07;
+const PINCH_DELTA_DEADZONE = 0.003;
+const INDEX_MOVE_DEADZONE = 0.005;
 const MEDIAPIPE_VISION_VERSION = "0.10.18";
 
-/**
- * Euclidean distance between two 3D landmarks.
- */
-function euclidean(a, b) {
+// ⚡ PERF: HUD updates throttled to ~4 fps instead of ~30 fps
+// Only gesture label + tracking status need React re-renders
+const HUD_UPDATE_INTERVAL = 250; // ms (~4 fps)
+
+// ── Math (zero-allocation) ──────────────────────────────
+
+/** Euclidean distance. Inlined z-fallback for MediaPipe landmarks. */
+function dist(a, b) {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
-    const dz = a.z - b.z;
+    const dz = (a.z || 0) - (b.z || 0);
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-/**
- * Linear interpolation.
- */
-function lerp(current, target, factor) {
-    return current + (target - current) * factor;
+/** Is a finger extended? Tip farther from wrist than PIP/IP joint. */
+function isFingerExtended(lm, tipIdx, pipIdx) {
+    const w = lm[0];
+    return dist(lm[tipIdx], w) > dist(lm[pipIdx], w);
 }
 
 /**
- * Map a value from [inMin, inMax] to [outMin, outMax], clamped.
+ * Count extended fingers.
+ * ⚡ PERF: No temporary array or .filter() — just a counter.
  */
-function mapRange(value, inMin, inMax, outMin, outMax) {
-    const clamped = Math.max(inMin, Math.min(inMax, value));
-    const ratio = (clamped - inMin) / (inMax - inMin);
-    return outMin + ratio * (outMax - outMin);
+function countExtendedTotal(lm) {
+    let total = 0;
+    if (isFingerExtended(lm, 4, 3)) total++; // thumb
+    if (isFingerExtended(lm, 8, 6)) total++; // index
+    if (isFingerExtended(lm, 12, 10)) total++; // middle
+    if (isFingerExtended(lm, 16, 14)) total++; // ring
+    if (isFingerExtended(lm, 20, 18)) total++; // pinky
+    return total;
+}
+
+/** Is the index finger specifically extended? */
+function isIndexExtended(lm) {
+    return isFingerExtended(lm, 8, 6);
 }
 
 /**
- * useHandTracking – React hook for real-time hand gesture recognition.
- *
- * Initialises the webcam → MediaPipe HandLandmarker pipeline and exposes
- * smoothed gesture state for controlling the 3D globe.
+ * Classify gesture. Priority: PINCH_ZOOM → FIST → OPEN_PALM → INDEX_MOVE → IDLE
+ * ⚡ PERF: Returns string constants (interned), no object allocation.
  */
+function classifyGesture(lm) {
+    if (dist(lm[4], lm[8]) < PINCH_THRESHOLD) return "PINCH_ZOOM";
+    const total = countExtendedTotal(lm);
+    if (total <= 1) return "FIST";
+    if (total >= 4) return "OPEN_PALM";
+    if (isIndexExtended(lm)) return "INDEX_MOVE";
+    return "IDLE";
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SHARED DATA REF (the core optimization)
+//
+//  ⚡ PERF: This single ref object is the "data bus" between the
+//  detection loop (writes) and the Three.js useFrame loop (reads).
+//  NO useState means NO React re-renders on every frame.
+//
+//  Three.js components read from trackingDataRef.current inside
+//  useFrame(), which runs outside React's reconciliation cycle.
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * Creates the initial shared data object.
+ * ⚡ PERF: Pre-allocated once, mutated in-place. Never replaced.
+ */
+function createTrackingData() {
+    return {
+        gestureState: "NONE",
+        pinchDeltaY: 0,
+        indexX: 0.5,
+        indexY: 0.5,
+        landmarks: null,       // raw array ref, NOT a copy
+        isTracking: false,
+        frameCounter: 0,       // for frame-skipping
+    };
+}
+
+// ════════════════════════════════════════════════════════════════
+
 export default function useHandTracking() {
-    // ── Refs (mutable, no re-renders) ──────────────────────
     const webcamRef = useRef(null);
     const handLandmarkerRef = useRef(null);
     const rafIdRef = useRef(null);
     const streamRef = useRef(null);
     const initDoneRef = useRef(false);
-
-    // Previous-frame landmark for delta calculation
-    const prevPalmRef = useRef(null);
     const lastVideoTimeRef = useRef(-1);
-    const isTrackingRef = useRef(false);
 
-    // Smoothed values (avoid re-renders on every frame)
-    const smoothedRef = useRef({
-        zoom: 1.0,
-        rotX: 0,
-        rotY: 0,
-    });
+    // ⚡ PERF: Shared data ref — THREE.js reads this directly via useFrame()
+    const trackingDataRef = useRef(createTrackingData());
 
-    // ── State (exposed to consumers) ──────────────────────
-    const [zoomLevel, setZoomLevel] = useState(1.0);
-    const [rotationX, setRotationX] = useState(0);
-    const [rotationY, setRotationY] = useState(0);
-    const [activeGesture, setActiveGesture] = useState("NONE");
-    const [isTracking, setIsTracking] = useState(false);
+    // Previous-frame refs for delta calculation
+    const prevPinchMidY = useRef(0);
+    const prevPinchValid = useRef(false);
+    const prevIndexX = useRef(0.5);
+    const prevIndexY = useRef(0.5);
+
+    // ⚡ PERF: Only these 3 use useState — for slow-updating HUD elements
+    const [hudGesture, setHudGesture] = useState("NONE");
+    const [hudTracking, setHudTracking] = useState(false);
     const [error, setError] = useState(null);
-    const [landmarks, setLandmarks] = useState(null);
 
-    // Throttle React state updates to ~30 fps for HUD
-    const lastUIUpdate = useRef(0);
-    const UI_UPDATE_INTERVAL = 33; // ms
+    const lastHudUpdate = useRef(0);
 
-    // ── Detection loop (stable ref, never changes) ─────────
+    // ── Detection loop ────────────────────────────────────
     const detectRef = useRef(null);
     detectRef.current = function detect() {
         const video = webcamRef.current;
-        const handLandmarker = handLandmarkerRef.current;
+        const hl = handLandmarkerRef.current;
 
-        if (
-            !video ||
-            !handLandmarker ||
-            video.readyState < 2 ||
-            video.videoWidth === 0
-        ) {
+        if (!video || !hl || video.readyState < 2 || video.videoWidth === 0) {
             rafIdRef.current = requestAnimationFrame(detectRef.current);
             return;
         }
 
-        // Ensure explicit dimensions are set for MediaPipe
-        if (video.width !== video.videoWidth || video.height !== video.videoHeight) {
+        // ⚡ PERF: Ensure dimensions only if changed
+        if (video.width !== video.videoWidth) {
             video.width = video.videoWidth;
             video.height = video.videoHeight;
         }
 
         const now = performance.now();
+        const td = trackingDataRef.current;
 
-        // Only process if we have a new video frame
+        // Only process new video frames
         if (video.currentTime !== lastVideoTimeRef.current) {
             lastVideoTimeRef.current = video.currentTime;
 
+            // ⚡ PERF: Frame-skipping — process every 2nd frame
+            // This halves CPU load from MediaPipe inference with minimal perceptual loss
+            td.frameCounter++;
+            if (td.frameCounter % 2 !== 0) {
+                rafIdRef.current = requestAnimationFrame(detectRef.current);
+                return;
+            }
+
             let results;
             try {
-                results = handLandmarker.detectForVideo(video, now);
-            } catch (e) {
-                // MediaPipe can throw on timestamp issues; just skip this frame
+                results = hl.detectForVideo(video, now);
+            } catch (_) {
                 rafIdRef.current = requestAnimationFrame(detectRef.current);
                 return;
             }
 
             if (results.landmarks && results.landmarks.length > 0) {
-                const landmarks = results.landmarks[0];
+                const lm = results.landmarks[0];
+                const gesture = classifyGesture(lm);
 
-                // ── Landmark references ──────────────────────────
-                const thumbTip = landmarks[4];
-                const indexTip = landmarks[8];
-                const palmCenter = landmarks[9];
+                // ⚡ PERF: Mutate shared ref in-place — zero object allocation
+                td.gestureState = gesture;
+                td.landmarks = lm; // Direct reference, NOT a copy
+                td.isTracking = true;
 
-                // ── Pinch-to-Zoom ────────────────────────────────
-                const pinchDist = euclidean(thumbTip, indexTip);
-                const targetZoom = mapRange(pinchDist, PINCH_MIN, PINCH_MAX, ZOOM_MIN, ZOOM_MAX);
-                smoothedRef.current.zoom = lerp(smoothedRef.current.zoom, targetZoom, LERP_FACTOR);
+                // ── Per-state delta computation ──────────
+                if (gesture === "PINCH_ZOOM") {
+                    const midY = (lm[4].y + lm[8].y) / 2;
+                    if (prevPinchValid.current) {
+                        const rawDy = midY - prevPinchMidY.current;
+                        // ⚡ PERF: Deadzone applied without object allocation
+                        td.pinchDeltaY = Math.abs(rawDy) > PINCH_DELTA_DEADZONE ? rawDy : 0;
+                    } else {
+                        td.pinchDeltaY = 0;
+                    }
+                    prevPinchMidY.current = midY;
+                    prevPinchValid.current = true;
+                } else {
+                    td.pinchDeltaY = 0;
+                    prevPinchValid.current = false;
 
-                // ── Drag-to-Rotate ───────────────────────────────
-                let deltaX = 0;
-                let deltaY = 0;
-                let dragMagnitude = 0;
-
-                if (prevPalmRef.current) {
-                    deltaX = palmCenter.x - prevPalmRef.current.x;
-                    deltaY = palmCenter.y - prevPalmRef.current.y;
-                    dragMagnitude = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-
-                    if (dragMagnitude > DRAG_THRESHOLD) {
-                        const targetRotY = smoothedRef.current.rotY - deltaX * ROTATION_SENSITIVITY;
-                        const targetRotX = smoothedRef.current.rotX + deltaY * ROTATION_SENSITIVITY;
-
-                        smoothedRef.current.rotY = lerp(smoothedRef.current.rotY, targetRotY, LERP_FACTOR * 3);
-                        smoothedRef.current.rotX = lerp(smoothedRef.current.rotX, targetRotX, LERP_FACTOR * 3);
+                    if (gesture === "INDEX_MOVE") {
+                        const tipX = lm[8].x;
+                        const tipY = lm[8].y;
+                        // ⚡ PERF: Deadzone — suppress jitter using scalar comparison
+                        const dx = Math.abs(tipX - prevIndexX.current);
+                        const dy = Math.abs(tipY - prevIndexY.current);
+                        if (dx > INDEX_MOVE_DEADZONE || dy > INDEX_MOVE_DEADZONE) {
+                            td.indexX = tipX;
+                            td.indexY = tipY;
+                            prevIndexX.current = tipX;
+                            prevIndexY.current = tipY;
+                        }
+                        // else: keep previous values, suppress jitter
                     }
                 }
-                prevPalmRef.current = { x: palmCenter.x, y: palmCenter.y };
 
-                // ── Gesture classification ───────────────────────
-                let gesture = "IDLE";
-                if (pinchDist < PINCH_ENGAGE_THRESHOLD) {
-                    gesture = "ZOOM";
-                } else if (dragMagnitude > DRAG_THRESHOLD) {
-                    gesture = "ROTATE";
-                }
-
-                // ── Throttled UI updates ─────────────────────────
-                if (now - lastUIUpdate.current > UI_UPDATE_INTERVAL) {
-                    setZoomLevel(smoothedRef.current.zoom);
-                    setRotationX(smoothedRef.current.rotX);
-                    setRotationY(smoothedRef.current.rotY);
-                    setActiveGesture(gesture);
-                    setLandmarks([...landmarks]);
-                    if (!isTrackingRef.current) {
-                        isTrackingRef.current = true;
-                        setIsTracking(true);
-                    }
-                    lastUIUpdate.current = now;
+                // ⚡ PERF: HUD React state only updates every 250ms (~4fps)
+                if (now - lastHudUpdate.current > HUD_UPDATE_INTERVAL) {
+                    setHudGesture(gesture);
+                    if (!hudTracking) setHudTracking(true);
+                    lastHudUpdate.current = now;
                 }
             } else {
-                // No hand detected
-                prevPalmRef.current = null;
-                if (now - lastUIUpdate.current > UI_UPDATE_INTERVAL) {
-                    setActiveGesture("NONE");
-                    setLandmarks(null);
-                    if (isTrackingRef.current) {
-                        isTrackingRef.current = false;
-                        setIsTracking(false);
-                    }
-                    lastUIUpdate.current = now;
+                // No hand
+                td.gestureState = "NONE";
+                td.landmarks = null;
+                td.isTracking = false;
+                td.pinchDeltaY = 0;
+                prevPinchValid.current = false;
+
+                if (now - lastHudUpdate.current > HUD_UPDATE_INTERVAL) {
+                    setHudGesture("NONE");
+                    if (hudTracking) setHudTracking(false);
+                    lastHudUpdate.current = now;
                 }
             }
         }
@@ -188,9 +233,8 @@ export default function useHandTracking() {
         rafIdRef.current = requestAnimationFrame(detectRef.current);
     };
 
-    // ── Initialisation (runs ONCE, empty deps) ────────────
+    // ── Init (runs once) ─────────────────────────────────
     useEffect(() => {
-        // Guard against StrictMode double-invoke
         if (initDoneRef.current) return;
         initDoneRef.current = true;
 
@@ -198,41 +242,32 @@ export default function useHandTracking() {
 
         async function init() {
             try {
-                // 1. Request webcam
+                // ⚡ PERF: Cap webcam to 640×480 — higher res slows MediaPipe inference
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: "user", width: 640, height: 480 },
                 });
 
-                if (cancelled) {
-                    stream.getTracks().forEach((t) => t.stop());
-                    return;
-                }
-
+                if (cancelled) { stream.getTracks().forEach(t => t.stop()); return; }
                 streamRef.current = stream;
 
-                // Create hidden video element
                 const video = document.createElement("video");
                 video.srcObject = stream;
                 video.setAttribute("playsinline", "true");
                 video.setAttribute("autoplay", "true");
                 video.muted = true;
                 video.style.display = "none";
-
                 video.onloadedmetadata = () => {
                     video.width = video.videoWidth;
                     video.height = video.videoHeight;
                 };
-
                 document.body.appendChild(video);
                 webcamRef.current = video;
-
                 await video.play();
 
-                // 2. Initialise MediaPipe HandLandmarker (CPU only – avoids WebGL contention)
+                // MediaPipe (CPU delegate — avoids WebGL contention with Three.js)
                 const vision = await FilesetResolver.forVisionTasks(
                     `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VISION_VERSION}/wasm`
                 );
-
                 if (cancelled) return;
 
                 const handLandmarker = await HandLandmarker.createFromOptions(vision, {
@@ -242,63 +277,49 @@ export default function useHandTracking() {
                         delegate: "CPU",
                     },
                     runningMode: "VIDEO",
-                    numHands: 1,
+                    numHands: 1, // ⚡ PERF: Single hand = 50% less inference work
                 });
 
-                if (cancelled) {
-                    handLandmarker.close();
-                    return;
-                }
-
+                if (cancelled) { handLandmarker.close(); return; }
                 handLandmarkerRef.current = handLandmarker;
-
-                // 3. Start detection loop
                 rafIdRef.current = requestAnimationFrame(detectRef.current);
             } catch (err) {
                 if (!cancelled) {
-                    console.error("[useHandTracking] Initialisation error:", err);
+                    console.error("[useHandTracking] Init error:", err);
                     setError(err.message || "Failed to initialise hand tracking.");
                 }
             }
         }
 
-        // Delay MediaPipe init to let Three.js establish WebGL context first
-        const initTimer = setTimeout(init, 3000);
+        const timer = setTimeout(init, 3000);
 
-        // ── Cleanup ──────────────────────────────────────────
         return () => {
             cancelled = true;
-            clearTimeout(initTimer);
-
-            if (rafIdRef.current) {
-                cancelAnimationFrame(rafIdRef.current);
-            }
-
+            clearTimeout(timer);
+            if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
             if (handLandmarkerRef.current) {
                 handLandmarkerRef.current.close();
                 handLandmarkerRef.current = null;
             }
-
             if (streamRef.current) {
-                streamRef.current.getTracks().forEach((t) => t.stop());
+                streamRef.current.getTracks().forEach(t => t.stop());
                 streamRef.current = null;
             }
-
             if (webcamRef.current) {
                 webcamRef.current.remove();
                 webcamRef.current = null;
             }
         };
-    }, []); // Empty deps – runs once
+    }, []);
 
+    // ⚡ PERF: Return the REF, not state values.
+    // GlobeScene reads trackingDataRef.current inside useFrame() (zero re-renders).
+    // Only hudGesture/hudTracking are React state (for the HUD text, ~4fps).
     return {
-        zoomLevel,
-        rotationX,
-        rotationY,
-        activeGesture,
-        isTracking,
-        webcamRef,
-        landmarks,
-        error,
+        trackingDataRef,    // REF — Three.js reads this directly in useFrame()
+        hudGesture,         // STATE — for HUD label only (~4fps updates)
+        hudTracking,        // STATE — for HUD tracking indicator
+        webcamRef,          // REF — for FullscreenWebcam canvas drawing
+        error,              // STATE — one-time error display
     };
 }

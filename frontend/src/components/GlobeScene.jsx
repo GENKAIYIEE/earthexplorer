@@ -1,78 +1,151 @@
 import { useRef, useMemo, useState, useCallback, useEffect } from "react";
-import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
-import { Stars } from "@react-three/drei";
+import { Canvas, useFrame, useLoader } from "@react-three/fiber";
 import * as THREE from "three";
 
-// ── Earth texture URLs (NASA Blue Marble via public CDN) ──
+// ════════════════════════════════════════════════════════════════
+//  PERFORMANCE-OPTIMIZED 3D GLOBE SCENE
+//
+//  Key optimizations (marked with "⚡ PERF"):
+//    1. Reads gesture data from a shared REF, not props
+//       → EarthMesh NEVER re-renders from gesture changes
+//    2. Reduced sphere segments: 48 → 32 (saves ~3,000 triangles)
+//    3. Shadows disabled, minimal lighting
+//    4. Atmosphere geometry reduced to 32 segments
+//    5. Geometry args memoized (static arrays)
+// ════════════════════════════════════════════════════════════════
+
 const EARTH_ALBEDO_URL =
     "https://unpkg.com/three-globe@2.41.12/example/img/earth-blue-marble.jpg";
 const EARTH_BUMP_URL =
     "https://unpkg.com/three-globe@2.41.12/example/img/earth-topology.png";
 
-// ── Lerp helper ──────────────────────────────────────────
-function lerpVal(current, target, factor) {
-    return current + (target - current) * factor;
-}
+const AUTO_ROTATE_SPEED = 0.003;
+const ZOOM_SENSITIVITY = 3.0;
+const INDEX_ROT_SENSITIVITY = 3.0;
+const LERP_SPEED = 0.08;
+const MIN_SCALE = 0.3;
+const MAX_SCALE = 3.0;
+
+// ⚡ PERF: Static geometry args — no new array created per render
+const EARTH_GEO_ARGS = [2, 32, 32];       // was [2, 48, 48] = 33% fewer triangles
+const ATMOSPHERE_GEO_ARGS = [2.05, 32, 32]; // was [2.05, 48, 48]
+
+function lerpVal(a, b, t) { return a + (b - a) * t; }
 
 /**
- * EarthMesh – The 3D globe mesh with albedo + bump textures.
+ * EarthMesh – Reads gesture data from trackingDataRef via useFrame.
+ *
+ * ⚡ PERF: This component receives trackingDataRef (a ref, not state).
+ * Props never change → React never re-renders this component.
+ * All animation happens inside useFrame(), which runs outside React.
  */
-function EarthMesh({ zoomLevel, rotationX, rotationY }) {
+function EarthMesh({ trackingDataRef }) {
     const meshRef = useRef();
     const atmosphereRef = useRef();
 
-    // Load textures
     const [albedoMap, bumpMap] = useLoader(THREE.TextureLoader, [
         EARTH_ALBEDO_URL,
         EARTH_BUMP_URL,
     ]);
 
-    // Internal smoothed values
-    const smoothed = useRef({ rotX: 0, rotY: 0, scale: 1 });
+    // Internal accumulated state (never triggers re-render)
+    const s = useRef({
+        rotX: 0,
+        rotY: 0,
+        scale: 1.0,
+        autoRotate: false,
+        prevIndexX: 0.5,
+        prevIndexY: 0.5,
+        frozen: false,
+    });
 
     useFrame(() => {
         if (!meshRef.current) return;
 
-        // Smooth transitions
-        smoothed.current.rotX = lerpVal(smoothed.current.rotX, rotationX, 0.06);
-        smoothed.current.rotY = lerpVal(smoothed.current.rotY, rotationY, 0.06);
-        smoothed.current.scale = lerpVal(smoothed.current.scale, zoomLevel, 0.08);
+        // ⚡ PERF: Read from shared ref — no props, no re-renders
+        const td = trackingDataRef.current;
+        const st = s.current;
 
-        // Apply rotation
-        meshRef.current.rotation.x = smoothed.current.rotX;
-        meshRef.current.rotation.y = smoothed.current.rotY + performance.now() * 0.00005;
+        switch (td.gestureState) {
+            case "PINCH_ZOOM": {
+                st.autoRotate = false;
+                st.frozen = false;
+                const zoomChange = -td.pinchDeltaY * ZOOM_SENSITIVITY;
+                st.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, st.scale + zoomChange));
+                st.prevIndexX = 0.5;
+                st.prevIndexY = 0.5;
+                break;
+            }
+            case "INDEX_MOVE": {
+                st.autoRotate = false;
+                st.frozen = false;
+                const dx = td.indexX - st.prevIndexX;
+                const dy = td.indexY - st.prevIndexY;
+                st.rotY -= dx * INDEX_ROT_SENSITIVITY;
+                st.rotX += dy * INDEX_ROT_SENSITIVITY;
+                st.rotX = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, st.rotX));
+                st.prevIndexX = td.indexX;
+                st.prevIndexY = td.indexY;
+                break;
+            }
+            case "OPEN_PALM": {
+                st.autoRotate = true;
+                st.frozen = false;
+                st.prevIndexX = 0.5;
+                st.prevIndexY = 0.5;
+                break;
+            }
+            case "FIST": {
+                st.autoRotate = false;
+                st.frozen = true;
+                st.prevIndexX = 0.5;
+                st.prevIndexY = 0.5;
+                break;
+            }
+            default: {
+                st.prevIndexX = td.indexX;
+                st.prevIndexY = td.indexY;
+                break;
+            }
+        }
 
-        // Apply scale from zoom
-        const s = smoothed.current.scale;
-        meshRef.current.scale.set(s, s, s);
+        if (st.autoRotate && !st.frozen) {
+            st.rotY += AUTO_ROTATE_SPEED;
+        }
 
-        // Sync atmosphere
+        // ⚡ PERF: Direct mutation of Three.js objects — no VDOM involved
+        meshRef.current.rotation.x = lerpVal(meshRef.current.rotation.x, st.rotX, LERP_SPEED);
+        meshRef.current.rotation.y = lerpVal(meshRef.current.rotation.y, st.rotY, LERP_SPEED);
+
+        const ns = lerpVal(meshRef.current.scale.x, st.scale, LERP_SPEED);
+        meshRef.current.scale.set(ns, ns, ns);
+
         if (atmosphereRef.current) {
             atmosphereRef.current.rotation.copy(meshRef.current.rotation);
-            const as = s * 1.025;
+            const as = ns * 1.025;
             atmosphereRef.current.scale.set(as, as, as);
         }
     });
 
-    // Atmosphere shader material
+    // ⚡ PERF: Atmosphere material created once via useMemo, never reconstructed
     const atmosphereMaterial = useMemo(
         () =>
             new THREE.ShaderMaterial({
                 vertexShader: `
-          varying vec3 vNormal;
-          void main() {
-            vNormal = normalize(normalMatrix * normal);
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-          }
-        `,
+                    varying vec3 vNormal;
+                    void main() {
+                        vNormal = normalize(normalMatrix * normal);
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
                 fragmentShader: `
-          varying vec3 vNormal;
-          void main() {
-            float intensity = pow(0.72 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 2.2);
-            vec3 color = vec3(0.13, 0.53, 0.96);
-            gl_FragColor = vec4(color, intensity * 0.6);
-          }
-        `,
+                    varying vec3 vNormal;
+                    void main() {
+                        float intensity = pow(0.72 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 2.2);
+                        vec3 color = vec3(0.13, 0.53, 0.96);
+                        gl_FragColor = vec4(color, intensity * 0.6);
+                    }
+                `,
                 blending: THREE.AdditiveBlending,
                 side: THREE.BackSide,
                 transparent: true,
@@ -83,9 +156,9 @@ function EarthMesh({ zoomLevel, rotationX, rotationY }) {
 
     return (
         <group>
-            {/* Earth */}
+            {/* ⚡ PERF: 32 segments instead of 48 = ~3,000 fewer triangles */}
             <mesh ref={meshRef}>
-                <sphereGeometry args={[2, 48, 48]} />
+                <sphereGeometry args={EARTH_GEO_ARGS} />
                 <meshStandardMaterial
                     map={albedoMap}
                     bumpMap={bumpMap}
@@ -94,68 +167,48 @@ function EarthMesh({ zoomLevel, rotationX, rotationY }) {
                     roughness={0.7}
                 />
             </mesh>
-
-            {/* Atmosphere glow */}
             <mesh ref={atmosphereRef} material={atmosphereMaterial}>
-                <sphereGeometry args={[2.05, 48, 48]} />
+                <sphereGeometry args={ATMOSPHERE_GEO_ARGS} />
             </mesh>
         </group>
     );
 }
 
 /**
- * GlobeScene – Full R3F canvas with Earth, lighting, and stars.
- * Uses alpha: true so the webcam background shows through.
+ * GlobeScene – R3F Canvas wrapper with context loss recovery.
+ *
+ * ⚡ PERF: trackingDataRef is a stable ref that never changes identity,
+ * so this component and EarthMesh never re-render from gesture data.
  */
-export default function GlobeScene({ zoomLevel, rotationX, rotationY }) {
+export default function GlobeScene({ trackingDataRef }) {
     const [contextLost, setContextLost] = useState(false);
     const canvasKeyRef = useRef(0);
     const [canvasKey, setCanvasKey] = useState(0);
 
     const handleCreated = useCallback(({ gl }) => {
-        gl.setClearColor(0x000000, 0); // Fully transparent clear
-
+        gl.setClearColor(0x000000, 0);
+        // ⚡ PERF: Disable shadow maps entirely — not used
+        gl.shadowMap.enabled = false;
         const canvas = gl.domElement;
-        canvas.addEventListener("webglcontextlost", (e) => {
-            e.preventDefault();
-            setContextLost(true);
-        });
-        canvas.addEventListener("webglcontextrestored", () => {
-            setContextLost(false);
-        });
+        canvas.addEventListener("webglcontextlost", (e) => { e.preventDefault(); setContextLost(true); });
+        canvas.addEventListener("webglcontextrestored", () => setContextLost(false));
     }, []);
 
-    // Auto-recover from context loss
     useEffect(() => {
         if (!contextLost) return;
-        const timer = setTimeout(() => {
-            canvasKeyRef.current += 1;
+        const t = setTimeout(() => {
+            canvasKeyRef.current++;
             setCanvasKey(canvasKeyRef.current);
             setContextLost(false);
         }, 1000);
-        return () => clearTimeout(timer);
+        return () => clearTimeout(t);
     }, [contextLost]);
 
     if (contextLost) {
         return (
-            <div
-                style={{
-                    position: "absolute",
-                    inset: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                }}
-            >
-                <div style={{
-                    width: "48px",
-                    height: "48px",
-                    border: "3px solid rgba(99, 102, 241, 0.3)",
-                    borderTopColor: "#22d3ee",
-                    borderRadius: "50%",
-                    animation: "spin 1s linear infinite",
-                }} />
-                <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <div style={{ width: 48, height: 48, border: "3px solid rgba(99,102,241,0.3)", borderTopColor: "#22d3ee", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+                <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
             </div>
         );
     }
@@ -169,31 +222,18 @@ export default function GlobeScene({ zoomLevel, rotationX, rotationY }) {
                 alpha: true,
                 powerPreference: "default",
                 failIfMajorPerformanceCaveat: false,
-                preserveDrawingBuffer: true,
+                // ⚡ PERF: preserveDrawingBuffer off saves a GPU copy per frame
+                preserveDrawingBuffer: false,
             }}
             onCreated={handleCreated}
-            style={{
-                position: "absolute",
-                inset: 0,
-                background: "transparent",
-            }}
+            style={{ position: "absolute", inset: 0, background: "transparent" }}
         >
-            {/* Lighting */}
-            <ambientLight intensity={0.35} color="#b0c4de" />
-            <directionalLight
-                position={[5, 3, 5]}
-                intensity={2.0}
-                color="#ffffff"
-                castShadow={false}
-            />
-            <directionalLight position={[-5, -2, -3]} intensity={0.4} color="#4a6fa5" />
+            {/* ⚡ PERF: Minimal lighting — 1 ambient + 1 directional (removed 2nd directional) */}
+            <ambientLight intensity={0.4} color="#b0c4de" />
+            <directionalLight position={[5, 3, 5]} intensity={2.0} color="#ffffff" />
 
-            {/* Earth */}
-            <EarthMesh
-                zoomLevel={zoomLevel}
-                rotationX={rotationX}
-                rotationY={rotationY}
-            />
+            {/* ⚡ PERF: trackingDataRef identity never changes → zero re-renders */}
+            <EarthMesh trackingDataRef={trackingDataRef} />
         </Canvas>
     );
 }

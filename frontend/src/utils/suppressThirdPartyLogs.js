@@ -24,7 +24,9 @@ const SUPPRESSED_PATTERNS = [
 
 function shouldSuppress(args) {
     if (!args || args.length === 0) return false;
-    const msg = typeof args[0] === "string" ? args[0] : String(args[0]);
+    // Join all arguments into a single string. This handles Emscripten/WASM
+    // console formats like console.log("%c...", "color:...", "INFO: ...")
+    const msg = args.map(String).join(" ");
     return SUPPRESSED_PATTERNS.some((pattern) => msg.includes(pattern));
 }
 
@@ -32,6 +34,8 @@ function shouldSuppress(args) {
 const originalWarn = console.warn;
 const originalInfo = console.info;
 const originalLog = console.log;
+const originalError = console.error;
+const originalDebug = console.debug;
 
 console.warn = (...args) => {
     if (shouldSuppress(args)) return;
@@ -46,4 +50,14 @@ console.info = (...args) => {
 console.log = (...args) => {
     if (shouldSuppress(args)) return;
     originalLog.apply(console, args);
+};
+
+console.error = (...args) => {
+    if (shouldSuppress(args)) return;
+    originalError.apply(console, args);
+};
+
+console.debug = (...args) => {
+    if (shouldSuppress(args)) return;
+    if (originalDebug) originalDebug.apply(console, args);
 };
